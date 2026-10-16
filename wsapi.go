@@ -50,6 +50,26 @@ type resumePacket struct {
 // Open creates a websocket connection to Discord.
 // See: https://discord.com/developers/docs/topics/gateway#connecting
 func (s *Session) Open() error {
+	return s.OpenContext(context.Background())
+}
+
+// OpenContext applies caller cancellation and a 30-second handshake budget.
+// The resulting connection belongs to Session, not to the opening context.
+func (s *Session) OpenContext(parent context.Context) error {
+	root, ok := s.beginGatewayWork()
+	if !ok {
+		return ErrSessionClosed
+	}
+	defer s.gatewayWorkers.Done()
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
+	defer cancel()
+	rootDone := make(chan struct{})
+	stopRoot := context.AfterFunc(root, func() { cancel(); close(rootDone) })
+	defer func() {
+		if !stopRoot() {
+			<-rootDone
+		}
+	}()
 	s.log(LogInformational, "called")
 
 	var err error
@@ -73,7 +93,7 @@ func (s *Session) Open() error {
 		gateway = s.resumeGatewayURL
 	} else {
 		if s.gateway == "" {
-			s.gateway, err = s.Gateway()
+			s.gateway, err = s.Gateway(WithContext(ctx))
 			if err != nil {
 				return err
 			}
@@ -89,7 +109,7 @@ func (s *Session) Open() error {
 	s.log(LogInformational, "connecting to gateway %s", gateway)
 	header := http.Header{}
 	header.Add("accept-encoding", "zlib")
-	s.wsConn, _, err = s.Dialer.Dial(gateway, header)
+	s.wsConn, _, err = s.Dialer.DialContext(ctx, gateway, header)
 	if err != nil {
 		s.log(LogError, "error connecting to gateway %s, %s", s.gateway, err)
 		s.gateway = "" // clear cached gateway
@@ -100,6 +120,14 @@ func (s *Session) Open() error {
 	s.wsConn.SetCloseHandler(func(code int, text string) error {
 		return nil
 	})
+	openingConn := s.wsConn
+	openingDone := make(chan struct{})
+	stopOpening := context.AfterFunc(ctx, func() { _ = openingConn.Close(); close(openingDone) })
+	defer func() {
+		if !stopOpening() {
+			<-openingDone
+		}
+	}()
 
 	defer func() {
 		// because of this, all code below must set err to the error
@@ -130,6 +158,10 @@ func (s *Session) Open() error {
 	var h helloOp
 	if err = json.Unmarshal(e.RawData, &h); err != nil {
 		err = fmt.Errorf("error unmarshalling helloOp, %s", err)
+		return err
+	}
+	if h.HeartbeatInterval <= 0 {
+		err = errors.New("invalid Gateway heartbeat interval")
 		return err
 	}
 
@@ -209,8 +241,9 @@ func (s *Session) Open() error {
 	s.listening = make(chan interface{})
 
 	// Start sending heartbeats and reading messages from Discord.
-	go s.heartbeat(s.wsConn, s.listening, h.HeartbeatInterval)
-	go s.listen(s.wsConn, s.listening)
+	conn, listening := s.wsConn, s.listening
+	s.gatewayGo(func() { s.heartbeat(conn, listening, h.HeartbeatInterval) })
+	s.gatewayGo(func() { s.listen(conn, listening) })
 
 	s.log(LogInformational, "exiting")
 	return nil
@@ -885,14 +918,19 @@ func (s *Session) reconnect() {
 
 	var err error
 
+	root, ok := s.beginGatewayWork()
+	if !ok {
+		return
+	}
+	defer s.gatewayWorkers.Done()
 	if s.ShouldReconnectOnError {
 
 		wait := time.Duration(1)
 
-		for {
+		for attempt := 0; attempt < 3; attempt++ {
 			s.log(LogInformational, "trying to reconnect to gateway")
 
-			err = s.Open()
+			err = s.OpenContext(root)
 			if err == nil {
 				s.log(LogInformational, "successfully reconnected to gateway")
 				return
@@ -907,7 +945,13 @@ func (s *Session) reconnect() {
 
 			s.log(LogError, "error reconnecting to gateway, %s", err)
 
-			<-time.After(wait * time.Second)
+			timer := time.NewTimer(wait * time.Second)
+			select {
+			case <-root.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
 			wait *= 2
 			if wait > 600 {
 				wait = 600
@@ -946,15 +990,10 @@ func (s *Session) CloseWithCode(closeCode int) (err error) {
 		s.log(LogInformational, "sending close frame")
 		// To cleanly close a connection, a client should send a close
 		// frame and wait for the server to close the connection.
-		s.wsMutex.Lock()
-		err := s.wsConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(closeCode, ""))
-		s.wsMutex.Unlock()
+		err := s.wsConn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(closeCode, ""), time.Now().Add(time.Second))
 		if err != nil {
 			s.log(LogInformational, "error closing websocket, %s", err)
 		}
-
-		// TODO: Wait for Discord to actually close the connection.
-		time.Sleep(1 * time.Second)
 
 		s.log(LogInformational, "closing gateway websocket")
 		err = s.wsConn.Close()

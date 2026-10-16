@@ -12,6 +12,7 @@
 package discordgo
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -134,6 +135,15 @@ type Session struct {
 
 	// used to make sure gateway websocket writes do not happen concurrently
 	wsMutex sync.Mutex
+
+	// Gateway lifetime is distinct from a reconnectable socket lifetime.
+	gatewayMu      sync.Mutex
+	gatewayContext context.Context
+	gatewayCancel  context.CancelFunc
+	gatewayClosed  bool
+	gatewayWorkers sync.WaitGroup
+	shutdownOnce   sync.Once
+	shutdownError  error
 }
 
 // ApplicationIntegrationType dictates where application can be installed and its available interaction contexts.

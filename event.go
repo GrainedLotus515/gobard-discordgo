@@ -102,12 +102,14 @@ func (s *Session) addEventHandlerOnce(eventHandler EventHandler) func() {
 // to a struct corresponding to the event for which you want to listen.
 //
 // eg:
-//     Session.AddHandler(func(s *discordgo.Session, m *discordgo.MessageCreate) {
-//     })
+//
+//	Session.AddHandler(func(s *discordgo.Session, m *discordgo.MessageCreate) {
+//	})
 //
 // or:
-//     Session.AddHandler(func(s *discordgo.Session, m *discordgo.PresenceUpdate) {
-//     })
+//
+//	Session.AddHandler(func(s *discordgo.Session, m *discordgo.PresenceUpdate) {
+//	})
 //
 // List of events can be found at this page, with corresponding names in the
 // library for each event: https://discord.com/developers/docs/topics/gateway#event-names
@@ -168,7 +170,8 @@ func (s *Session) handle(t string, i interface{}) {
 		if s.SyncEvents {
 			eh.eventHandler.Handle(s, i)
 		} else {
-			go eh.eventHandler.Handle(s, i)
+			handler := eh.eventHandler
+			s.gatewayGo(func() { handler.Handle(s, i) })
 		}
 	}
 
@@ -177,7 +180,8 @@ func (s *Session) handle(t string, i interface{}) {
 			if s.SyncEvents {
 				eh.eventHandler.Handle(s, i)
 			} else {
-				go eh.eventHandler.Handle(s, i)
+				handler := eh.eventHandler
+				s.gatewayGo(func() { handler.Handle(s, i) })
 			}
 		}
 		s.onceHandlers[t] = nil
@@ -229,9 +233,9 @@ func (s *Session) onInterface(i interface{}) {
 	case *GuildUpdate:
 		setGuildIds(t.Guild)
 	case *VoiceServerUpdate:
-		go s.onVoiceServerUpdate(t)
+		s.gatewayGo(func() { s.onVoiceServerUpdate(t) })
 	case *VoiceStateUpdate:
-		go s.onVoiceStateUpdate(t)
+		s.gatewayGo(func() { s.onVoiceStateUpdate(t) })
 	}
 	err := s.State.OnInterface(s, i)
 	if err != nil {
